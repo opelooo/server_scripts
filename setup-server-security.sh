@@ -279,8 +279,8 @@ configure_firewall() {
         if command -v tailscale >/dev/null 2>&1 || ip link show tailscale0 >/dev/null 2>&1; then
             ufw allow in on tailscale0 comment "Tailscale mesh network"
         fi
-        log_info "Allowing and rate-limiting target SSH port: ${TARGET_SSH_PORT}/tcp"
-        ufw limit "${TARGET_SSH_PORT}/tcp" comment "SSH rate-limited"
+        log_info "Allowing target SSH port: ${TARGET_SSH_PORT}/tcp"
+        ufw allow "${TARGET_SSH_PORT}/tcp" comment "SSH port"
         if [[ "${TARGET_SSH_PORT}" != "22" ]]; then
             ufw delete allow 22/tcp 2>/dev/null || true
             ufw delete limit 22/tcp 2>/dev/null || true
