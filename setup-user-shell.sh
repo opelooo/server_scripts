@@ -4,13 +4,14 @@
 # Target: Debian, Ubuntu, RHEL, AlmaLinux, RockyLinux
 # Scope: Supports multiple shells: fish, zsh, bash, nushell, mksh, tcsh.
 #        Includes interactive menu, non-interactive flags, PATH setup,
-#        custom configs, and optional Starship prompt integration.
+#        custom configs, optional Starship prompt, and system-wide defaults (--all).
 #
 set -euo pipefail
 
 TARGET_SHELL=""
 TARGET_USER=""
 ENABLE_STARSHIP=false
+APPLY_ALL=false
 
 log_info() {
     echo "[INFO] $1"
@@ -50,6 +51,10 @@ parse_arguments() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --all|--all-users|--system-wide)
+                APPLY_ALL=true
+                shift 1
+                ;;
             --starship)
                 ENABLE_STARSHIP=true
                 shift 1
@@ -194,14 +199,15 @@ install_shell_package() {
     return 0
 }
 
-configure_user_environment() {
+write_user_shell_config() {
+    local username="$1"
     local user_home
-    user_home=$(getent passwd "${TARGET_USER}" | cut -d: -f6)
+    user_home=$(getent passwd "${username}" | cut -d: -f6)
+
     if [[ ! -d "${user_home}" ]]; then
         return 0
     fi
 
-    log_info "Configuring default environment for '${TARGET_SHELL}'..."
     case "${TARGET_SHELL}" in
         fish)
             mkdir -p "${user_home}/.config/fish"
@@ -211,7 +217,7 @@ alias ll='ls -lha --color=auto'
 alias la='ls -A --color=auto'
 alias l='ls -CF --color=auto'
 EOF
-            chown -R "${TARGET_USER}:${TARGET_USER}" "${user_home}/.config"
+            chown -R "${username}:${username}" "${user_home}/.config" 2>/dev/null || true
             ;;
         zsh)
             if [[ ! -f "${user_home}/.zshrc" ]]; then
@@ -224,7 +230,7 @@ autoload -Uz compinit && compinit
 zstyle ':completion:*' menu select
 PROMPT='%F{green}%n@%m%f:%F{blue}%~%f$ '
 EOF
-                chown "${TARGET_USER}:${TARGET_USER}" "${user_home}/.zshrc"
+                chown "${username}:${username}" "${user_home}/.zshrc" 2>/dev/null || true
             fi
             ;;
         bash)
@@ -239,9 +245,20 @@ EOF
         nushell)
             mkdir -p "${user_home}/.config/nushell"
             touch "${user_home}/.config/nushell/config.nu"
-            chown -R "${TARGET_USER}:${TARGET_USER}" "${user_home}/.config"
+            chown -R "${username}:${username}" "${user_home}/.config" 2>/dev/null || true
             ;;
     esac
+    return 0
+}
+
+configure_user_environment() {
+    log_info "Configuring default environment for user '${TARGET_USER}'..."
+    write_user_shell_config "${TARGET_USER}"
+
+    if [[ "${APPLY_ALL}" == "true" ]] && [[ "${TARGET_USER}" != "root" ]]; then
+        log_info "Applying shell configuration for root user..."
+        write_user_shell_config "root"
+    fi
     return 0
 }
 
@@ -253,20 +270,27 @@ install_starship_if_requested() {
     log_info "Installing Starship cross-shell prompt..."
     curl -sS https://starship.rs/install.sh | sh -s -- --yes >/dev/null 2>&1
 
-    local user_home
-    user_home=$(getent passwd "${TARGET_USER}" | cut -d: -f6)
+    local users_to_hook=("${TARGET_USER}")
+    if [[ "${APPLY_ALL}" == "true" ]] && [[ "${TARGET_USER}" != "root" ]]; then
+        users_to_hook+=("root")
+    fi
 
-    case "${TARGET_SHELL}" in
-        fish)
-            echo "starship init fish | source" >> "${user_home}/.config/fish/config.fish"
-            ;;
-        zsh)
-            echo 'eval "$(starship init zsh)"' >> "${user_home}/.zshrc"
-            ;;
-        bash)
-            echo 'eval "$(starship init bash)"' >> "${user_home}/.bashrc"
-            ;;
-    esac
+    for u in "${users_to_hook[@]}"; do
+        local user_home
+        user_home=$(getent passwd "${u}" | cut -d: -f6)
+        case "${TARGET_SHELL}" in
+            fish)
+                echo "starship init fish | source" >> "${user_home}/.config/fish/config.fish"
+                ;;
+            zsh)
+                echo 'eval "$(starship init zsh)"' >> "${user_home}/.zshrc"
+                ;;
+            bash)
+                echo 'eval "$(starship init bash)"' >> "${user_home}/.bashrc"
+                ;;
+        esac
+    done
+
     log_info "Starship prompt hooked into ${TARGET_SHELL}."
     return 0
 }
@@ -292,13 +316,26 @@ register_and_change_shell() {
 
     log_info "Changing default login shell for '${TARGET_USER}' to ${shell_bin}..."
     chsh -s "${shell_bin}" "${TARGET_USER}" || usermod -s "${shell_bin}" "${TARGET_USER}"
+
+    # If --all is passed, also update root and system defaults for future new users
+    if [[ "${APPLY_ALL}" == "true" ]]; then
+        log_info "Setting default shell for root..."
+        chsh -s "${shell_bin}" root || usermod -s "${shell_bin}" root
+
+        log_info "Setting system default shell for future new users..."
+        useradd -D -s "${shell_bin}" 2>/dev/null || true
+        if [[ -f /etc/adduser.conf ]]; then
+            sed -i -E "s|^#?DSHELL=.*|DSHELL=${shell_bin}|" /etc/adduser.conf
+        fi
+    fi
+
     return 0
 }
 
 verify_shell_change() {
     local current_shell
     current_shell=$(getent passwd "${TARGET_USER}" | cut -d: -f7)
-    log_info "Current shell in /etc/passwd: ${current_shell}"
+    log_info "Current shell in /etc/passwd for '${TARGET_USER}': ${current_shell}"
 
     local check_name="${TARGET_SHELL}"
     if [[ "${TARGET_SHELL}" == "nushell" ]]; then
@@ -328,9 +365,10 @@ main() {
 
     echo "====================================================="
     echo "Summary of shell configuration:"
-    echo "  Target User : ${TARGET_USER}"
-    echo "  Login Shell : ${TARGET_SHELL}"
-    echo "  Starship    : ${ENABLE_STARSHIP}"
+    echo "  Target User    : ${TARGET_USER}"
+    echo "  Login Shell    : ${TARGET_SHELL}"
+    echo "  Applied System : ${APPLY_ALL}"
+    echo "  Starship       : ${ENABLE_STARSHIP}"
     echo "====================================================="
     echo "Note: Log out and reconnect via SSH to enter your new shell."
 }
