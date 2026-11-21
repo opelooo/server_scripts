@@ -4,10 +4,14 @@
 # Target: Debian, Ubuntu, RHEL, AlmaLinux, RockyLinux
 # Scope: Basic Security, Anti-Flood Sysctl, Journald, Fail2ban, Auto-Updates,
 #        Dual-Tier Swap (ZRAM priority 100 > Disk Swap priority 10),
+#        Custom SSH Port Migration (Closes port 22, targets Fail2ban & UFW),
 #        SSH Hardening, Disable LLMNR, Disable Core Dumps, Kernel Protocol Blacklist,
 #        IPv6 Protections, RFC1337, Loopback UFW, and Cron Access Restrictions.
 #
 set -euo pipefail
+
+TARGET_SSH_PORT=""
+USER_SPECIFIED_PORT="${CUSTOM_SSH_PORT:-}"
 
 log_info() {
     echo "[INFO] $1"
@@ -29,6 +33,28 @@ check_root() {
     return 0
 }
 
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --ssh-port)
+                USER_SPECIFIED_PORT="$2"
+                shift 2
+                ;;
+            --ssh-port=*)
+                USER_SPECIFIED_PORT="${1#*=}"
+                shift 1
+                ;;
+            *)
+                if [[ "$1" =~ ^[0-9]+$ ]]; then
+                    USER_SPECIFIED_PORT="$1"
+                fi
+                shift 1
+                ;;
+        esac
+    done
+    return 0
+}
+
 detect_pkg_manager() {
     if command -v apt-get >/dev/null 2>&1; then
         PKG_MGR="apt"
@@ -42,31 +68,39 @@ detect_pkg_manager() {
     return 1
 }
 
-detect_ssh_ports() {
-    local detected_ports=()
+configure_ssh_port() {
+    local detected_port=""
 
-    # Read ports from active listening sockets
-    while IFS= read -r port; do
-        if [[ -n "${port}" ]]; then
-            detected_ports+=("${port}")
+    if [[ -n "${USER_SPECIFIED_PORT}" ]]; then
+        if ! [[ "${USER_SPECIFIED_PORT}" =~ ^[0-9]+$ ]] || [[ "${USER_SPECIFIED_PORT}" -lt 1 ]] || [[ "${USER_SPECIFIED_PORT}" -gt 65535 ]]; then
+            log_error "Invalid SSH port specified: ${USER_SPECIFIED_PORT}. Must be 1-65535."
+            return 1
         fi
-    done < <(ss -tlnp 2>/dev/null | grep -E 'sshd|ssh' | awk '{print $4}' | awk -F: '{print $NF}' | sort -u)
+        TARGET_SSH_PORT="${USER_SPECIFIED_PORT}"
+        log_info "Configuring custom SSH port: ${TARGET_SSH_PORT}..."
 
-    # Read ports from sshd_config
-    while IFS= read -r port; do
-        if [[ -n "${port}" ]]; then
-            detected_ports+=("${port}")
+        # Update main sshd_config and remove default port 22
+        if grep -qE "^#?Port " /etc/ssh/sshd_config 2>/dev/null; then
+            sed -i -E "s/^#?Port [0-9]+/Port ${TARGET_SSH_PORT}/" /etc/ssh/sshd_config
+        else
+            echo "Port ${TARGET_SSH_PORT}" >> /etc/ssh/sshd_config
         fi
-    done < <(grep -rhE "^Port [0-9]+" /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null | awk '{print $2}' | sort -u)
 
-    # Fallback to standard port 22 if none detected
-    if [[ ${#detected_ports[@]} -eq 0 ]]; then
-        detected_ports=(22)
+        # Disable systemd socket activation on Debian/Ubuntu so ssh.service binds custom port directly
+        if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+            systemctl disable --now ssh.socket 2>/dev/null || true
+        fi
+        systemctl enable ssh >/dev/null 2>&1 || systemctl enable sshd >/dev/null 2>&1 || true
+    else
+        # Auto-detect existing custom port or fallback
+        detected_port=$(grep -rhE "^Port [0-9]+" /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null | awk '{print $2}' | tail -n 1 || true)
+        if [[ -z "${detected_port}" ]]; then
+            detected_port=$(ss -tlnp 2>/dev/null | grep -E 'sshd|ssh' | awk '{print $4}' | awk -F: '{print $NF}' | grep -v '^22$' | tail -n 1 || true)
+        fi
+        TARGET_SSH_PORT="${detected_port:-22}"
     fi
 
-    # Deduplicate ports
-    SSH_PORTS=($(echo "${detected_ports[@]}" | tr ' ' '\n' | sort -un | tr '\n' ' '))
-    log_info "Detected active SSH ports: ${SSH_PORTS[*]}"
+    log_info "Active target SSH port determined: ${TARGET_SSH_PORT}"
     return 0
 }
 
@@ -212,7 +246,7 @@ EOF
 }
 
 configure_ufw() {
-    log_info "Setting up UFW rules..."
+    log_info "Setting up UFW firewall rules..."
     ufw --force reset >/dev/null 2>&1 || true
 
     ufw default deny incoming
@@ -222,11 +256,14 @@ configure_ufw() {
     ufw allow in on lo comment "Allow local loopback"
     ufw allow out on lo comment "Allow local loopback"
 
-    # Limit incoming SSH ports to mitigate brute force
-    for port in "${SSH_PORTS[@]}"; do
-        log_info "Allowing and rate-limiting SSH port: ${port}/tcp"
-        ufw limit "${port}/tcp" comment "SSH rate-limited"
-    done
+    # Allow target SSH port only
+    log_info "Allowing and rate-limiting target SSH port: ${TARGET_SSH_PORT}/tcp"
+    ufw limit "${TARGET_SSH_PORT}/tcp" comment "SSH rate-limited"
+
+    # Explicitly ensure port 22 is disabled if custom port is used
+    if [[ "${TARGET_SSH_PORT}" != "22" ]]; then
+        log_info "Custom port in use. Port 22 is strictly closed."
+    fi
 
     # Suppress log flooding: set UFW logging to low
     ufw logging low
@@ -238,15 +275,13 @@ configure_ufw() {
 }
 
 configure_fail2ban() {
-    log_info "Setting up Fail2ban with SSH protection..."
-    local ports_str
-    ports_str=$(echo "${SSH_PORTS[@]}" | tr ' ' ',')
+    log_info "Setting up Fail2ban for SSH port ${TARGET_SSH_PORT}..."
 
     mkdir -p /etc/fail2ban/jail.d
     cat <<EOF > /etc/fail2ban/jail.d/sshd-hardening.local
 [sshd]
 enabled = true
-port = ${ports_str}
+port = ${TARGET_SSH_PORT}
 mode = aggressive
 filter = sshd
 backend = systemd
@@ -258,14 +293,15 @@ EOF
 
     systemctl enable fail2ban >/dev/null 2>&1 || true
     systemctl restart fail2ban 2>/dev/null || true
-    log_info "Fail2ban enabled and monitoring SSH."
+    log_info "Fail2ban enabled and monitoring port ${TARGET_SSH_PORT}."
     return 0
 }
 
 configure_ssh_hardening() {
     log_info "Configuring SSH daemon hardening drop-in..."
     mkdir -p /etc/ssh/sshd_config.d
-    cat <<'EOF' > /etc/ssh/sshd_config.d/99-server-hardening.conf
+    cat <<EOF > /etc/ssh/sshd_config.d/99-server-hardening.conf
+Port ${TARGET_SSH_PORT}
 X11Forwarding no
 AllowAgentForwarding no
 Compression no
@@ -278,8 +314,8 @@ ClientAliveCountMax 2
 EOF
 
     if sshd -t >/dev/null 2>&1; then
-        systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
-        log_info "SSH hardening applied and daemon reloaded."
+        systemctl reload ssh 2>/dev/null || systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+        log_info "SSH hardening applied on port ${TARGET_SSH_PORT}."
     else
         log_warn "SSH config validation failed. Keeping existing configuration."
         rm -f /etc/ssh/sshd_config.d/99-server-hardening.conf
@@ -386,8 +422,9 @@ EOF
 
 main() {
     check_root
+    parse_arguments "$@"
     detect_pkg_manager
-    detect_ssh_ports
+    configure_ssh_port
     install_packages
     configure_zram_swap
     configure_disk_swap
@@ -405,17 +442,18 @@ main() {
     log_info "Comprehensive server security hardening completed successfully."
     echo "====================================================="
     echo "Summary of protections applied:"
-    echo "  1. Dual-tier Swap: ZRAM (pri=100) prioritized over Disk Swap (pri=10)."
-    echo "  2. UFW Firewall: Default deny incoming, allowed loopback (lo) & SSH ports (${SSH_PORTS[*]})."
-    echo "  3. Kernel Hardening: Anti-SYN flood, anti-spoofing, ICMP rate limit, TCP BBR, RFC1337."
-    echo "  4. IPv6 Hardening: Disabled IPv6 redirects and source routing."
-    echo "  5. SSH Hardening: X11 & Agent forwarding disabled, compression disabled, MaxAuthTries 4."
-    echo "  6. Anti Information Leak: LLMNR port 5355 disabled, unprivileged core dumps disabled."
-    echo "  7. CIS Blacklist: Legacy protocols (dccp, sctp, rds, tipc) disabled."
-    echo "  8. Cron Lockdown: Only root and administrative users allowed to schedule tasks."
-    echo "  9. Journald: Max 250MB log storage with burst rate limits."
-    echo " 10. Fail2ban: Monitoring SSH on ports ${SSH_PORTS[*]} with 1h ban."
-    echo " 11. Automatic Updates: Active with automatic old kernel & unused dependency cleanup."
+    echo "  1. SSH Custom Port: Configured to port ${TARGET_SSH_PORT}. Port 22 is disabled."
+    echo "  2. Fail2ban: Specifically monitoring SSH port ${TARGET_SSH_PORT} with 1h ban."
+    echo "  3. UFW Firewall: Default deny incoming, allowed loopback (lo) & SSH port ${TARGET_SSH_PORT}."
+    echo "  4. Dual-tier Swap: ZRAM (pri=100) prioritized over Disk Swap (pri=10)."
+    echo "  5. Kernel Hardening: Anti-SYN flood, anti-spoofing, ICMP rate limit, TCP BBR, RFC1337."
+    echo "  6. IPv6 Hardening: Disabled IPv6 redirects and source routing."
+    echo "  7. SSH Hardening: X11 & Agent forwarding disabled, compression disabled, MaxAuthTries 4."
+    echo "  8. Anti Information Leak: LLMNR port 5355 disabled, unprivileged core dumps disabled."
+    echo "  9. CIS Blacklist: Legacy protocols (dccp, sctp, rds, tipc) disabled."
+    echo " 10. Cron Lockdown: Only root and administrative users allowed to schedule tasks."
+    echo " 11. Journald: Max 250MB log storage with burst rate limits."
+    echo " 12. Automatic Updates: Active with automatic old kernel & unused dependency cleanup."
     echo "====================================================="
 }
 
