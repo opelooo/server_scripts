@@ -2,13 +2,15 @@
 #
 # Generic Linux User Shell Switcher Script
 # Target: Debian, Ubuntu, RHEL, AlmaLinux, RockyLinux
-# Scope: Installs target shell (fish/zsh/bash) if missing, ensures /etc/shells entry,
-#        and safely updates default login shell for the specified user.
+# Scope: Supports multiple shells: fish, zsh, bash, nushell, mksh, tcsh.
+#        Includes interactive menu, non-interactive flags, PATH setup,
+#        custom configs, and optional Starship prompt integration.
 #
 set -euo pipefail
 
-TARGET_SHELL="${1:-fish}"
-TARGET_USER="${2:-${SUDO_USER:-$USER}}"
+TARGET_SHELL=""
+TARGET_USER=""
+ENABLE_STARSHIP=false
 
 log_info() {
     echo "[INFO] $1"
@@ -43,6 +45,78 @@ detect_pkg_manager() {
     return 1
 }
 
+parse_arguments() {
+    TARGET_USER="${SUDO_USER:-$USER}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --starship)
+                ENABLE_STARSHIP=true
+                shift 1
+                ;;
+            --user)
+                TARGET_USER="$2"
+                shift 2
+                ;;
+            fish|zsh|bash|nushell|nu|mksh|ksh|tcsh)
+                TARGET_SHELL="$1"
+                shift 1
+                ;;
+            *)
+                if [[ -z "${TARGET_SHELL}" ]] && [[ ! "$1" =~ ^-- ]]; then
+                    TARGET_SHELL="$1"
+                elif [[ -z "${TARGET_USER}" ]]; then
+                    TARGET_USER="$1"
+                fi
+                shift 1
+                ;;
+        esac
+    done
+
+    # Normalize aliases
+    if [[ "${TARGET_SHELL}" == "nu" ]]; then
+        TARGET_SHELL="nushell"
+    fi
+    if [[ "${TARGET_SHELL}" == "ksh" ]]; then
+        TARGET_SHELL="mksh"
+    fi
+    return 0
+}
+
+prompt_interactive_selection() {
+    if [[ -n "${TARGET_SHELL}" ]]; then
+        return 0
+    fi
+
+    # If running interactively with a TTY, display menu
+    if [[ -t 0 ]]; then
+        echo "====================================================="
+        echo "Select a login shell to install and configure:"
+        echo "  1) fish    - Friendly Interactive Shell (autosuggestions, syntax highlighting)"
+        echo "  2) zsh     - Z Shell (popular, robust, customizable)"
+        echo "  3) bash    - Bourne Again Shell (enhanced modern aliases & colors)"
+        echo "  4) nushell - Structured data shell (fast, typed tables, written in Rust)"
+        echo "  5) mksh    - MirBSD KornShell (ultra-lightweight, minimal memory footprint)"
+        echo "  6) tcsh    - TENEX C Shell (C-like syntax)"
+        echo "====================================================="
+        read -r -p "Enter choice [1-6] (default: 1): " choice
+        case "${choice}" in
+            2) TARGET_SHELL="zsh" ;;
+            3) TARGET_SHELL="bash" ;;
+            4) TARGET_SHELL="nushell" ;;
+            5) TARGET_SHELL="mksh" ;;
+            6) TARGET_SHELL="tcsh" ;;
+            *) TARGET_SHELL="fish" ;;
+        esac
+    else
+        # Default to fish for headless pipe execution
+        TARGET_SHELL="fish"
+    fi
+
+    log_info "Selected target shell: ${TARGET_SHELL}"
+    return 0
+}
+
 validate_target_user() {
     if ! id "${TARGET_USER}" >/dev/null 2>&1; then
         log_error "Target user '${TARGET_USER}' does not exist on this system."
@@ -52,37 +126,165 @@ validate_target_user() {
     return 0
 }
 
-install_shell_package() {
-    log_info "Verifying if '${TARGET_SHELL}' is installed..."
-    if command -v "${TARGET_SHELL}" >/dev/null 2>&1; then
-        log_info "Shell '${TARGET_SHELL}' is already installed at: $(command -v "${TARGET_SHELL}")"
+install_nushell_binary() {
+    if command -v nu >/dev/null 2>&1; then
         return 0
     fi
 
-    log_info "Shell '${TARGET_SHELL}' not found. Installing via ${PKG_MGR}..."
+    log_info "Downloading standalone Nushell release from GitHub..."
+    local arch
+    arch=$(uname -m)
+    local nu_arch="x86_64"
+    if [[ "${arch}" == "aarch64" ]]; then
+        nu_arch="aarch64"
+    fi
+
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    local nu_url
+    nu_url=$(curl -s https://api.github.com/repos/nushell/nushell/releases/latest | grep "browser_download_url.*${nu_arch}-unknown-linux-musl.tar.gz" | cut -d : -f 2,3 | tr -d '" ' | head -n 1)
+
+    if [[ -z "${nu_url}" ]]; then
+        nu_url="https://github.com/nushell/nushell/releases/download/0.100.0/nu-0.100.0-${nu_arch}-unknown-linux-musl.tar.gz"
+    fi
+
+    curl -sL "${nu_url}" -o "${tmp_dir}/nu.tar.gz"
+    tar -xzf "${tmp_dir}/nu.tar.gz" -C "${tmp_dir}"
+    local extracted_bin
+    extracted_bin=$(find "${tmp_dir}" -type f -name "nu" | head -n 1)
+
+    if [[ -n "${extracted_bin}" ]]; then
+        cp "${extracted_bin}" /usr/local/bin/nu
+        chmod 755 /usr/local/bin/nu
+        ln -sf /usr/local/bin/nu /usr/local/bin/nushell
+    fi
+
+    rm -rf "${tmp_dir}"
+    log_info "Nushell installed at /usr/local/bin/nu"
+    return 0
+}
+
+install_shell_package() {
+    local bin_name="${TARGET_SHELL}"
+    if [[ "${TARGET_SHELL}" == "nushell" ]]; then
+        bin_name="nu"
+    fi
+
+    if command -v "${bin_name}" >/dev/null 2>&1; then
+        log_info "Shell binary '${bin_name}' is already installed."
+        return 0
+    fi
+
+    log_info "Installing '${TARGET_SHELL}' via ${PKG_MGR}..."
+    if [[ "${TARGET_SHELL}" == "nushell" ]]; then
+        install_nushell_binary
+        return 0
+    fi
+
     if [[ "${PKG_MGR}" == "apt" ]]; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
-        apt-get install -y -qq --no-install-recommends "${TARGET_SHELL}"
+        apt-get install -y -qq --no-install-recommends "${TARGET_SHELL}" curl tar
     elif [[ "${PKG_MGR}" == "dnf" ]]; then
         dnf install -y -q epel-release || true
-        dnf install -y -q "${TARGET_SHELL}"
+        dnf install -y -q "${TARGET_SHELL}" curl tar
     fi
 
-    log_info "Shell package installed successfully."
+    log_info "Package installation completed."
+    return 0
+}
+
+configure_user_environment() {
+    local user_home
+    user_home=$(getent passwd "${TARGET_USER}" | cut -d: -f6)
+    if [[ ! -d "${user_home}" ]]; then
+        return 0
+    fi
+
+    log_info "Configuring default environment for '${TARGET_SHELL}'..."
+    case "${TARGET_SHELL}" in
+        fish)
+            mkdir -p "${user_home}/.config/fish"
+            cat <<'EOF' > "${user_home}/.config/fish/config.fish"
+fish_add_path /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin
+alias ll='ls -lha --color=auto'
+alias la='ls -A --color=auto'
+alias l='ls -CF --color=auto'
+EOF
+            chown -R "${TARGET_USER}:${TARGET_USER}" "${user_home}/.config"
+            ;;
+        zsh)
+            if [[ ! -f "${user_home}/.zshrc" ]]; then
+                cat <<'EOF' > "${user_home}/.zshrc"
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+alias ll='ls -lha --color=auto'
+alias la='ls -A --color=auto'
+alias l='ls -CF --color=auto'
+autoload -Uz compinit && compinit
+zstyle ':completion:*' menu select
+PROMPT='%F{green}%n@%m%f:%F{blue}%~%f$ '
+EOF
+                chown "${TARGET_USER}:${TARGET_USER}" "${user_home}/.zshrc"
+            fi
+            ;;
+        bash)
+            if [[ -f "${user_home}/.bashrc" ]] && ! grep -q "alias ll=" "${user_home}/.bashrc"; then
+                cat <<'EOF' >> "${user_home}/.bashrc"
+alias ll='ls -lha --color=auto'
+alias la='ls -A --color=auto'
+alias l='ls -CF --color=auto'
+EOF
+            fi
+            ;;
+        nushell)
+            mkdir -p "${user_home}/.config/nushell"
+            touch "${user_home}/.config/nushell/config.nu"
+            chown -R "${TARGET_USER}:${TARGET_USER}" "${user_home}/.config"
+            ;;
+    esac
+    return 0
+}
+
+install_starship_if_requested() {
+    if [[ "${ENABLE_STARSHIP}" != "true" ]]; then
+        return 0
+    fi
+
+    log_info "Installing Starship cross-shell prompt..."
+    curl -sS https://starship.rs/install.sh | sh -s -- --yes >/dev/null 2>&1
+
+    local user_home
+    user_home=$(getent passwd "${TARGET_USER}" | cut -d: -f6)
+
+    case "${TARGET_SHELL}" in
+        fish)
+            echo "starship init fish | source" >> "${user_home}/.config/fish/config.fish"
+            ;;
+        zsh)
+            echo 'eval "$(starship init zsh)"' >> "${user_home}/.zshrc"
+            ;;
+        bash)
+            echo 'eval "$(starship init bash)"' >> "${user_home}/.bashrc"
+            ;;
+    esac
+    log_info "Starship prompt hooked into ${TARGET_SHELL}."
     return 0
 }
 
 register_and_change_shell() {
+    local bin_name="${TARGET_SHELL}"
+    if [[ "${TARGET_SHELL}" == "nushell" ]]; then
+        bin_name="nu"
+    fi
+
     local shell_bin
-    shell_bin=$(command -v "${TARGET_SHELL}" || true)
+    shell_bin=$(command -v "${bin_name}" || true)
 
     if [[ -z "${shell_bin}" ]] || [[ ! -x "${shell_bin}" ]]; then
-        log_error "Executable binary for '${TARGET_SHELL}' could not be located."
+        log_error "Executable binary for '${TARGET_SHELL}' not found."
         return 1
     fi
 
-    # Register binary in /etc/shells if missing
     if ! grep -q "^${shell_bin}$" /etc/shells 2>/dev/null; then
         log_info "Registering ${shell_bin} into /etc/shells..."
         echo "${shell_bin}" >> /etc/shells
@@ -90,53 +292,47 @@ register_and_change_shell() {
 
     log_info "Changing default login shell for '${TARGET_USER}' to ${shell_bin}..."
     chsh -s "${shell_bin}" "${TARGET_USER}" || usermod -s "${shell_bin}" "${TARGET_USER}"
-
-    local user_home
-    user_home=$(getent passwd "${TARGET_USER}" | cut -d: -f6)
-
-    # Basic initial setup for fish shell if selected
-    if [[ "${TARGET_SHELL}" == "fish" ]] && [[ -d "${user_home}" ]]; then
-        local fish_conf_dir="${user_home}/.config/fish"
-        mkdir -p "${fish_conf_dir}"
-        if [[ ! -f "${fish_conf_dir}/config.fish" ]]; then
-            cat <<'EOF' > "${fish_conf_dir}/config.fish"
-# Ensure standard system binary paths are available
-fish_add_path /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin
-EOF
-            chown -R "${TARGET_USER}:${TARGET_USER}" "${user_home}/.config" 2>/dev/null || true
-            log_info "Created initial fish config at ${fish_conf_dir}/config.fish"
-        fi
-    fi
-
     return 0
 }
 
 verify_shell_change() {
     local current_shell
     current_shell=$(getent passwd "${TARGET_USER}" | cut -d: -f7)
-    log_info "Current configured shell for '${TARGET_USER}': ${current_shell}"
+    log_info "Current shell in /etc/passwd: ${current_shell}"
 
-    if [[ "${current_shell}" == *"${TARGET_SHELL}"* ]]; then
-        log_info "Verification SUCCESS: Shell updated successfully."
+    local check_name="${TARGET_SHELL}"
+    if [[ "${TARGET_SHELL}" == "nushell" ]]; then
+        check_name="nu"
+    fi
+
+    if [[ "${current_shell}" == *"${check_name}"* ]]; then
+        log_info "Verification SUCCESS: Login shell successfully updated."
         return 0
     fi
 
-    log_error "Verification FAILED: Shell does not match requested '${TARGET_SHELL}'."
+    log_error "Verification FAILED: Shell does not match '${TARGET_SHELL}'."
     return 1
 }
 
 main() {
     check_root
     detect_pkg_manager
+    parse_arguments "$@"
+    prompt_interactive_selection
     validate_target_user
     install_shell_package
+    configure_user_environment
+    install_starship_if_requested
     register_and_change_shell
     verify_shell_change
 
     echo "====================================================="
-    echo "Default shell for user '${TARGET_USER}' is now '${TARGET_SHELL}'."
-    echo "Note: Log out and log back in for the change to take full effect."
+    echo "Summary of shell configuration:"
+    echo "  Target User : ${TARGET_USER}"
+    echo "  Login Shell : ${TARGET_SHELL}"
+    echo "  Starship    : ${ENABLE_STARSHIP}"
     echo "====================================================="
+    echo "Note: Log out and reconnect via SSH to enter your new shell."
 }
 
 main "$@"

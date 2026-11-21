@@ -23,10 +23,10 @@ Script hardening keamanan dan optimalisasi server Linux komprehensif:
 
 **Eksekusi dengan Port SSH Custom (Misal Port 2291):**
 ```bash
-# Dari Gitea Pribadi
+# Melalui Gitea Pribadi
 curl -sL https://git.opelooo.uk/opelooo/server_scripts/raw/branch/main/setup-server-security.sh | sudo bash -s -- --ssh-port 2291
 
-# Dari GitHub
+# Melalui GitHub
 curl -sL https://raw.githubusercontent.com/opelooo/server_scripts/main/setup-server-security.sh | sudo bash -s -- --ssh-port 2291
 ```
 
@@ -38,28 +38,47 @@ curl -sL https://git.opelooo.uk/opelooo/server_scripts/raw/branch/main/setup-ser
 ---
 
 ### 2. `setup-user-shell.sh`
-Script otomatisasi untuk mengganti default login shell user (mendukung `fish`, `zsh`, `bash`). Menginstall paket shell secara otomatis jika belum ada, memastikan pendaftaran di `/etc/shells`, dan mengonfigurasi shell bawaan user.
+Script serbaguna untuk mengganti default login shell user dengan berbagai pilihan shell modern dan hemat memori:
+* **Pilihan Shell yang Didukung**:
+  * `fish` - Friendly Interactive Shell (autosuggestions, syntax highlighting).
+  * `zsh` - Z Shell (ekstensibel, prompt berwarna, autocompletion menu).
+  * `bash` - Bourne Again Shell (dilengkapi alias modern `ll`, `la`).
+  * `nushell` - Shell data terstruktur berbasis Rust (tabel interaktif & pipelines).
+  * `mksh` - MirBSD KornShell (ultra-ringan, RAM < 1 MB).
+  * `tcsh` - TENEX C Shell.
+* **Mode Interaktif**: Jika dijalankan di terminal, menampilkan menu pemilihan bernomor [1-6].
+* **Integrasi Starship Prompt**: Opsi flag `--starship` untuk memasang prompt lintas-shell modern secara otomatis.
 
 #### Penggunaan
 
-**Ganti ke Fish Shell (Default):**
+**1. Mode Menu Interaktif (Tampil Pilihan 1-6):**
 ```bash
-# Dari Gitea Pribadi
-curl -sL https://git.opelooo.uk/opelooo/server_scripts/raw/branch/main/setup-user-shell.sh | sudo bash
-
-# Dari GitHub
-curl -sL https://raw.githubusercontent.com/opelooo/server_scripts/main/setup-user-shell.sh | sudo bash
+sudo ./setup-user-shell.sh
 ```
 
-**Ganti ke ZSH Shell:**
+**2. Langsung Memilih Shell Tertentu via cURL:**
 ```bash
+# Ganti ke Fish
+curl -sL https://git.opelooo.uk/opelooo/server_scripts/raw/branch/main/setup-user-shell.sh | sudo bash -s -- fish
+
+# Ganti ke ZSH
 curl -sL https://git.opelooo.uk/opelooo/server_scripts/raw/branch/main/setup-user-shell.sh | sudo bash -s -- zsh
+
+# Ganti ke Nushell
+curl -sL https://git.opelooo.uk/opelooo/server_scripts/raw/branch/main/setup-user-shell.sh | sudo bash -s -- nushell
+
+# Ganti ke MKSH (Ultra-ringan)
+curl -sL https://git.opelooo.uk/opelooo/server_scripts/raw/branch/main/setup-user-shell.sh | sudo bash -s -- mksh
 ```
 
-**Eksekusi Lokal:**
+**3. Ganti Shell Sekaligus Pasang Starship Prompt:**
 ```bash
-# Format: sudo ./setup-user-shell.sh [SHELL_NAME] [USERNAME]
-sudo ./setup-user-shell.sh fish opelooo
+curl -sL https://git.opelooo.uk/opelooo/server_scripts/raw/branch/main/setup-user-shell.sh | sudo bash -s -- fish --starship
+```
+
+**4. Menentukan User Tertentu:**
+```bash
+sudo ./setup-user-shell.sh zsh --user opelooo
 ```
 
 ---
