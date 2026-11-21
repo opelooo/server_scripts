@@ -21,26 +21,50 @@ Script hardening keamanan dan optimalisasi server Linux komprehensif:
 
 #### Penggunaan
 
-**1. Eksekusi dengan Port SSH Custom (Misal Port 2291):**
+**Eksekusi dengan Port SSH Custom (Misal Port 2291):**
 ```bash
-# Melalui Gitea Pribadi
+# Dari Gitea Pribadi
 curl -sL https://git.opelooo.uk/opelooo/server_scripts/raw/branch/main/setup-server-security.sh | sudo bash -s -- --ssh-port 2291
 
-# Melalui GitHub
+# Dari GitHub
 curl -sL https://raw.githubusercontent.com/opelooo/server_scripts/main/setup-server-security.sh | sudo bash -s -- --ssh-port 2291
-
-# Atau eksekusi file lokal
-sudo ./setup-server-security.sh --ssh-port 2291
 ```
 
-**2. Eksekusi Tanpa Parameter (Otomatis Mendeteksi Port yang Ada):**
+**Eksekusi Tanpa Parameter (Otomatis Mendeteksi Port yang Ada):**
 ```bash
 curl -sL https://git.opelooo.uk/opelooo/server_scripts/raw/branch/main/setup-server-security.sh | sudo bash
 ```
 
 ---
 
-### 2. `setup-tailscale-relay.sh`
+### 2. `setup-user-shell.sh`
+Script otomatisasi untuk mengganti default login shell user (mendukung `fish`, `zsh`, `bash`). Menginstall paket shell secara otomatis jika belum ada, memastikan pendaftaran di `/etc/shells`, dan mengonfigurasi shell bawaan user.
+
+#### Penggunaan
+
+**Ganti ke Fish Shell (Default):**
+```bash
+# Dari Gitea Pribadi
+curl -sL https://git.opelooo.uk/opelooo/server_scripts/raw/branch/main/setup-user-shell.sh | sudo bash
+
+# Dari GitHub
+curl -sL https://raw.githubusercontent.com/opelooo/server_scripts/main/setup-user-shell.sh | sudo bash
+```
+
+**Ganti ke ZSH Shell:**
+```bash
+curl -sL https://git.opelooo.uk/opelooo/server_scripts/raw/branch/main/setup-user-shell.sh | sudo bash -s -- zsh
+```
+
+**Eksekusi Lokal:**
+```bash
+# Format: sudo ./setup-user-shell.sh [SHELL_NAME] [USERNAME]
+sudo ./setup-user-shell.sh fish opelooo
+```
+
+---
+
+### 3. `setup-tailscale-relay.sh`
 Script add-on opsional untuk server yang ingin difungsikan sebagai **Tailscale Peer Relay**:
 * Membuka akses interface `tailscale0` di UFW.
 * Membuka port UDP relay (default: `41641/udp`).
