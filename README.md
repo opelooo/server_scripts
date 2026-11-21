@@ -1,15 +1,15 @@
 # Server Scripts
 
-Koleksi script otomatisasi dan hardening keamanan untuk server Linux (Debian, Ubuntu, RHEL, AlmaLinux, RockyLinux).
+Koleksi script otomatisasi dan hardening keamanan untuk server Linux (Debian, Ubuntu, RHEL, AlmaLinux, RockyLinux, Oracle Linux).
 
 ## Isi Repositori
 
 ### 1. `setup-server-security.sh`
 Script hardening keamanan dan optimalisasi server Linux komprehensif:
-* **Custom SSH Port Migration**: Opsi mengubah port SSH dari default 22 ke port custom (misal 2291). Port 22 ditutup total di firewall dan sshd.
+* **Custom SSH Port Migration**: Opsi mengubah port SSH dari default 22 ke port custom (misal 2291 atau 2292). Port 22 ditutup total di firewall dan sshd.
 * **Fail2ban Dedicated Port**: Memantau secara spesifik port SSH custom yang aktif dengan ban 1 jam setelah 5 kali gagal autentikasi.
 * **Dual-Tier Swap**: Mengutamakan **ZRAM** (prioritas 100) di RAM terlebih dahulu, dengan fallback **Disk Swap** (prioritas 10) jika memori fisik penuh untuk mencegah crash OOM.
-* **UFW Firewall**: Default deny incoming, default allow outgoing, eksplisit allow pada loopback (`lo`), membuka port SSH custom (dan menutup port 22), serta level log `low`.
+* **Firewall Support (UFW & firewalld)**: Mendukung otomatis UFW (Debian/Ubuntu) dan firewalld (RHEL/Oracle Linux). Menutup port 22/layanan default ssh, memasang loopback (`lo`) di zona terpercaya, serta menjaga port layanan yang sudah berjalan (seperti RustDesk).
 * **SSH Daemon Hardening**: Mematikan X11 forwarding, menonaktifkan agent forwarding, mematikan kompresi (anti side-channel), menonaktifkan login password root (`prohibit-password`), membatasi `MaxAuthTries 4`, dan menyetel timeout idle.
 * **Kernel Sysctl Hardening**: Proteksi SYN flood, anti IP spoofing (`rp_filter`), ICMP ping rate limit, RFC 1337 TIME-WAIT protection, strict FIFO file protection di `/tmp`, menonaktifkan logging martian packet, serta mengaktifkan **TCP BBR** + FQ qdisc.
 * **IPv6 Security**: Menonaktifkan IPv6 redirects dan source-routed packets untuk mencegah serangan man-in-the-middle / rogue router.
@@ -85,7 +85,7 @@ sudo ./setup-user-shell.sh zsh --user opelooo
 
 ### 3. `setup-tailscale-relay.sh`
 Script add-on opsional untuk server yang ingin difungsikan sebagai **Tailscale Peer Relay**:
-* Membuka akses interface `tailscale0` di UFW.
+* Membuka akses interface `tailscale0` di UFW / firewalld (trusted zone).
 * Membuka port UDP relay (default: `41641/udp`).
 * Menambahkan subnet CGNAT Tailscale (`100.64.0.0/10`) ke whitelist Fail2ban.
 * Mengaktifkan client relay port via `tailscale set --relay-server-port`.
