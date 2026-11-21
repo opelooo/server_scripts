@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # Tailscale Peer Relay & Firewall Add-on Script
-# Target: Any Linux server with Tailscale installed
-# Scope: Configures Tailscale Peer Relay port, UFW rules, and Fail2ban whitelist
+# Target: Any Linux server with Tailscale installed (Debian, Ubuntu, RHEL, Oracle Linux)
+# Scope: Configures Tailscale Peer Relay port, Firewall rules (UFW/firewalld), and Fail2ban whitelist
 #
 set -euo pipefail
 
@@ -11,6 +11,10 @@ RELAY_PORT="${1:-${DEFAULT_RELAY_PORT}}"
 
 log_info() {
     echo "[INFO] $1"
+}
+
+log_warn() {
+    echo "[WARN] $1"
 }
 
 log_error() {
@@ -33,20 +37,26 @@ check_tailscale_installed() {
     return 0
 }
 
-configure_ufw_for_tailscale() {
-    if ! command -v ufw >/dev/null 2>&1; then
-        log_info "UFW not found. Skipping UFW configuration."
+configure_firewall_for_tailscale() {
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+        log_info "firewalld detected. Adding Tailscale rules to firewalld..."
+        firewall-cmd --permanent --zone=trusted --add-interface=tailscale0 2>/dev/null || true
+        firewall-cmd --permanent --add-port="${RELAY_PORT}/udp"
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        log_info "firewalld updated for Tailscale."
         return 0
     fi
 
-    log_info "Allowing full traffic on tailscale0 interface..."
-    ufw allow in on tailscale0 comment "Tailscale mesh network"
+    if command -v ufw >/dev/null 2>&1; then
+        log_info "UFW detected. Adding Tailscale rules to UFW..."
+        ufw allow in on tailscale0 comment "Tailscale mesh network"
+        ufw allow "${RELAY_PORT}/udp" comment "Tailscale Peer Relay UDP"
+        ufw reload >/dev/null 2>&1 || true
+        log_info "UFW updated for Tailscale."
+        return 0
+    fi
 
-    log_info "Allowing inbound UDP port ${RELAY_PORT} for Peer Relay..."
-    ufw allow "${RELAY_PORT}/udp" comment "Tailscale Peer Relay UDP"
-
-    ufw reload >/dev/null 2>&1 || true
-    log_info "UFW updated for Tailscale."
+    log_warn "Neither firewalld nor UFW is active. Skipping firewall configuration."
     return 0
 }
 
@@ -78,7 +88,7 @@ activate_peer_relay() {
 main() {
     check_root
     check_tailscale_installed
-    configure_ufw_for_tailscale
+    configure_firewall_for_tailscale
     whitelist_tailscale_in_fail2ban
     activate_peer_relay
 

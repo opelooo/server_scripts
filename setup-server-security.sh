@@ -112,7 +112,11 @@ install_packages() {
         apt-get install -y -qq --no-install-recommends ufw fail2ban unattended-upgrades curl iproute2 zram-tools cron
     elif [[ "${PKG_MGR}" == "dnf" ]]; then
         dnf install -y -q epel-release || true
-        dnf install -y -q --setopt=install_weak_deps=False ufw fail2ban curl iproute zram-generator dnf-automatic cronie
+        local fw_pkg="ufw"
+        if command -v firewall-cmd >/dev/null 2>&1 || systemctl is-active --quiet firewalld 2>/dev/null; then
+            fw_pkg=""
+        fi
+        dnf install -y -q --setopt=install_weak_deps=False ${fw_pkg} fail2ban curl iproute zram-generator dnf-automatic cronie
     fi
     return 0
 }
@@ -126,16 +130,17 @@ PERCENT=50
 PRIORITY=100
 EOF
         systemctl restart zramswap 2>/dev/null || true
-    elif command -v zramctl >/dev/null 2>&1; then
+    elif command -v zramctl >/dev/null 2>&1 || [[ -f /usr/lib/systemd/system-generators/zram-generator ]]; then
         mkdir -p /etc/systemd/zram-generator.conf.d
-        cat <<'EOF' > /etc/systemd/zram-generator.conf.d/00-zram.conf
+        cat <<'EOF' > /etc/systemd/zram-generator.conf
 [zram0]
 zram-size = min(ram / 2, 2048)
 compression-algorithm = zstd
 swap-priority = 100
 EOF
+        cp -f /etc/systemd/zram-generator.conf /etc/systemd/zram-generator.conf.d/00-zram.conf 2>/dev/null || true
         systemctl daemon-reload
-        systemctl restart systemd-zram-setup@zram0.service 2>/dev/null || true
+        systemctl restart /dev/zram0 2>/dev/null || systemctl restart systemd-zram-setup@zram0.service 2>/dev/null || true
     fi
     log_info "ZRAM swap configured."
     return 0
@@ -245,32 +250,42 @@ EOF
     return 0
 }
 
-configure_ufw() {
-    log_info "Setting up UFW firewall rules..."
-    ufw --force reset >/dev/null 2>&1 || true
-
-    ufw default deny incoming
-    ufw default allow outgoing
-
-    # Allow local loopback explicitly for inter-process communication
-    ufw allow in on lo comment "Allow local loopback"
-    ufw allow out on lo comment "Allow local loopback"
-
-    # Allow target SSH port only
-    log_info "Allowing and rate-limiting target SSH port: ${TARGET_SSH_PORT}/tcp"
-    ufw limit "${TARGET_SSH_PORT}/tcp" comment "SSH rate-limited"
-
-    # Explicitly ensure port 22 is disabled if custom port is used
-    if [[ "${TARGET_SSH_PORT}" != "22" ]]; then
-        log_info "Custom port in use. Port 22 is strictly closed."
+configure_firewall() {
+    log_info "Configuring firewall rules..."
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
+        log_info "firewalld detected and active. Hardening firewalld rules..."
+        firewall-cmd --permanent --zone=trusted --add-interface=lo 2>/dev/null || true
+        log_info "Allowing target SSH port: ${TARGET_SSH_PORT}/tcp in firewalld"
+        firewall-cmd --permanent --add-port="${TARGET_SSH_PORT}/tcp"
+        if [[ "${TARGET_SSH_PORT}" != "22" ]]; then
+            firewall-cmd --permanent --remove-service=ssh 2>/dev/null || true
+            firewall-cmd --permanent --remove-port=22/tcp 2>/dev/null || true
+            log_info "Port 22/ssh service removed from firewalld."
+        fi
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        log_info "firewalld active and configured."
+        return 0
     fi
 
-    # Suppress log flooding: set UFW logging to low
-    ufw logging low
+    if command -v ufw >/dev/null 2>&1; then
+        log_info "Setting up UFW firewall rules..."
+        ufw --force reset >/dev/null 2>&1 || true
+        ufw default deny incoming
+        ufw default allow outgoing
+        ufw allow in on lo comment "Allow local loopback"
+        ufw allow out on lo comment "Allow local loopback"
+        log_info "Allowing and rate-limiting target SSH port: ${TARGET_SSH_PORT}/tcp"
+        ufw limit "${TARGET_SSH_PORT}/tcp" comment "SSH rate-limited"
+        if [[ "${TARGET_SSH_PORT}" != "22" ]]; then
+            log_info "Custom port in use. Port 22 is strictly closed."
+        fi
+        ufw logging low
+        ufw --force enable
+        log_info "UFW active and configured."
+        return 0
+    fi
 
-    # Enable UFW non-interactively
-    ufw --force enable
-    log_info "UFW active and configured."
+    log_warn "Neither firewalld nor UFW is active. Skipping firewall configuration."
     return 0
 }
 
@@ -430,7 +445,7 @@ main() {
     configure_disk_swap
     apply_sysctl_hardening
     apply_journald_caps
-    configure_ufw
+    configure_firewall
     configure_fail2ban
     configure_ssh_hardening
     disable_llmnr
@@ -444,7 +459,7 @@ main() {
     echo "Summary of protections applied:"
     echo "  1. SSH Custom Port: Configured to port ${TARGET_SSH_PORT}. Port 22 is disabled."
     echo "  2. Fail2ban: Specifically monitoring SSH port ${TARGET_SSH_PORT} with 1h ban."
-    echo "  3. UFW Firewall: Default deny incoming, allowed loopback (lo) & SSH port ${TARGET_SSH_PORT}."
+    echo "  3. Firewall: Hardened via UFW or firewalld (default deny/lo trusted & SSH port ${TARGET_SSH_PORT})."
     echo "  4. Dual-tier Swap: ZRAM (pri=100) prioritized over Disk Swap (pri=10)."
     echo "  5. Kernel Hardening: Anti-SYN flood, anti-spoofing, ICMP rate limit, TCP BBR, RFC1337."
     echo "  6. IPv6 Hardening: Disabled IPv6 redirects and source routing."
