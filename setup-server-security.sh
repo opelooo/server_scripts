@@ -255,6 +255,9 @@ configure_firewall() {
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
         log_info "firewalld detected and active. Hardening firewalld rules..."
         firewall-cmd --permanent --zone=trusted --add-interface=lo 2>/dev/null || true
+        if command -v tailscale >/dev/null 2>&1 || ip link show tailscale0 >/dev/null 2>&1; then
+            firewall-cmd --permanent --zone=trusted --add-interface=tailscale0 2>/dev/null || true
+        fi
         log_info "Allowing target SSH port: ${TARGET_SSH_PORT}/tcp in firewalld"
         firewall-cmd --permanent --add-port="${TARGET_SSH_PORT}/tcp"
         if [[ "${TARGET_SSH_PORT}" != "22" ]]; then
@@ -269,14 +272,19 @@ configure_firewall() {
 
     if command -v ufw >/dev/null 2>&1; then
         log_info "Setting up UFW firewall rules..."
-        ufw --force reset >/dev/null 2>&1 || true
         ufw default deny incoming
         ufw default allow outgoing
         ufw allow in on lo comment "Allow local loopback"
         ufw allow out on lo comment "Allow local loopback"
+        if command -v tailscale >/dev/null 2>&1 || ip link show tailscale0 >/dev/null 2>&1; then
+            ufw allow in on tailscale0 comment "Tailscale mesh network"
+        fi
         log_info "Allowing and rate-limiting target SSH port: ${TARGET_SSH_PORT}/tcp"
         ufw limit "${TARGET_SSH_PORT}/tcp" comment "SSH rate-limited"
         if [[ "${TARGET_SSH_PORT}" != "22" ]]; then
+            ufw delete allow 22/tcp 2>/dev/null || true
+            ufw delete limit 22/tcp 2>/dev/null || true
+            ufw delete allow 22 2>/dev/null || true
             log_info "Custom port in use. Port 22 is strictly closed."
         fi
         ufw logging low
@@ -303,7 +311,7 @@ backend = systemd
 maxretry = 5
 findtime = 10m
 bantime = 1h
-ignoreip = 127.0.0.1/8 ::1
+ignoreip = 100.64.0.0/10 127.0.0.1/8 ::1
 EOF
 
     systemctl enable fail2ban >/dev/null 2>&1 || true
