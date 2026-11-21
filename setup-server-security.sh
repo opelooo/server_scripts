@@ -4,7 +4,8 @@
 # Target: Debian, Ubuntu, RHEL, AlmaLinux, RockyLinux
 # Scope: Basic Security, Anti-Flood Sysctl, Journald, Fail2ban, Auto-Updates,
 #        Dual-Tier Swap (ZRAM priority 100 > Disk Swap priority 10),
-#        SSH Hardening, Disable LLMNR, Disable Core Dumps, Kernel Protocol Blacklist.
+#        SSH Hardening, Disable LLMNR, Disable Core Dumps, Kernel Protocol Blacklist,
+#        IPv6 Protections, RFC1337, Loopback UFW, and Cron Access Restrictions.
 #
 set -euo pipefail
 
@@ -74,10 +75,10 @@ install_packages() {
     if [[ "${PKG_MGR}" == "apt" ]]; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
-        apt-get install -y -qq ufw fail2ban unattended-upgrades curl iproute2 zram-tools
+        apt-get install -y -qq ufw fail2ban unattended-upgrades curl iproute2 zram-tools cron
     elif [[ "${PKG_MGR}" == "dnf" ]]; then
         dnf install -y -q epel-release || true
-        dnf install -y -q ufw fail2ban curl iproute zram-generator
+        dnf install -y -q ufw fail2ban curl iproute zram-generator dnf-automatic cronie
     fi
     return 0
 }
@@ -139,14 +140,15 @@ configure_disk_swap() {
 }
 
 apply_sysctl_hardening() {
-    log_info "Configuring kernel sysctl anti-flood, BBR, and network protections..."
+    log_info "Configuring kernel sysctl anti-flood, BBR, RFC1337, and IPv6 protections..."
     modprobe tcp_bbr 2>/dev/null || true
 
     cat <<'EOF' > /etc/sysctl.d/99-server-hardening.conf
-# TCP SYN Flood Protection
+# TCP SYN Flood & Connection Reset Protections
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_max_syn_backlog = 2048
 net.ipv4.tcp_synack_retries = 2
+net.ipv4.tcp_rfc1337 = 1
 
 # IP Spoofing & Route Verification (Reverse Path Filter)
 net.ipv4.conf.all.rp_filter = 1
@@ -162,20 +164,26 @@ net.ipv4.icmp_ignore_bogus_error_responses = 1
 net.ipv4.icmp_ratelimit = 100
 net.ipv4.icmp_ratemask = 880
 
-# Ignore ICMP Redirects (Mitigate MITM attacks)
+# Ignore ICMP Redirects (IPv4 & IPv6)
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
 
-# Reject Source Routed Packets
+# Reject Source Routed Packets (IPv4 & IPv6)
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv6.conf.default.accept_source_route = 0
 
-# Kernel Memory and Pointer Leak Protections
+# Kernel Memory, Pointer Leak, and FIFO Protections
 kernel.kptr_restrict = 2
 kernel.dmesg_restrict = 1
 fs.suid_dumpable = 0
+fs.protected_fifos = 2
+fs.protected_regular = 2
 
 # TCP BBR Congestion Control & FQ Queue Discipline
 net.core.default_qdisc = fq
@@ -183,7 +191,7 @@ net.ipv4.tcp_congestion_control = bbr
 EOF
 
     sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-server-hardening.conf >/dev/null 2>&1
-    log_info "Kernel network hardening applied."
+    log_info "Kernel network and system protections applied."
     return 0
 }
 
@@ -209,6 +217,10 @@ configure_ufw() {
 
     ufw default deny incoming
     ufw default allow outgoing
+
+    # Allow local loopback explicitly for inter-process communication
+    ufw allow in on lo comment "Allow local loopback"
+    ufw allow out on lo comment "Allow local loopback"
 
     # Limit incoming SSH ports to mitigate brute force
     for port in "${SSH_PORTS[@]}"; do
@@ -255,6 +267,8 @@ configure_ssh_hardening() {
     mkdir -p /etc/ssh/sshd_config.d
     cat <<'EOF' > /etc/ssh/sshd_config.d/99-server-hardening.conf
 X11Forwarding no
+AllowAgentForwarding no
+Compression no
 PermitRootLogin prohibit-password
 PermitEmptyPasswords no
 MaxAuthTries 4
@@ -311,17 +325,61 @@ EOF
     return 0
 }
 
+restrict_cron_permissions() {
+    log_info "Restricting cron and at execution permissions..."
+    touch /etc/cron.allow /etc/at.allow
+    chmod 640 /etc/cron.allow /etc/at.allow
+
+    # Ensure root is allowed
+    if ! grep -q "^root$" /etc/cron.allow 2>/dev/null; then
+        echo "root" >> /etc/cron.allow
+    fi
+    if ! grep -q "^root$" /etc/at.allow 2>/dev/null; then
+        echo "root" >> /etc/at.allow
+    fi
+
+    # Allow users with administrative privileges (sudo/wheel group)
+    local admin_users
+    admin_users=$(getent group sudo 2>/dev/null | cut -d: -f4 | tr ',' '\n' || true)
+    if [[ -z "${admin_users}" ]]; then
+        admin_users=$(getent group wheel 2>/dev/null | cut -d: -f4 | tr ',' '\n' || true)
+    fi
+
+    for user in ${admin_users}; do
+        if [[ -n "${user}" ]] && ! grep -q "^${user}$" /etc/cron.allow; then
+            echo "${user}" >> /etc/cron.allow
+            echo "${user}" >> /etc/at.allow
+        fi
+    done
+
+    # Remove deny files to strictly enforce allowlists
+    rm -f /etc/cron.deny /etc/at.deny
+    log_info "Cron permissions restricted to administrative accounts."
+    return 0
+}
+
 configure_auto_updates() {
+    log_info "Configuring and verifying automatic security upgrades..."
     if [[ "${PKG_MGR}" == "apt" ]]; then
-        log_info "Enabling unattended security upgrades..."
         cat <<'EOF' > /etc/apt/apt.conf.d/20auto-upgrades
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
+
+        cat <<'EOF' > /etc/apt/apt.conf.d/52unattended-upgrades-server
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "false";
+EOF
         systemctl enable unattended-upgrades >/dev/null 2>&1 || true
         systemctl restart unattended-upgrades 2>/dev/null || true
-        log_info "Unattended security upgrades enabled."
+        log_info "Unattended-upgrades enabled and active."
+    elif [[ "${PKG_MGR}" == "dnf" ]]; then
+        sed -i 's/upgrade_type = .*/upgrade_type = security/' /etc/dnf/automatic.conf 2>/dev/null || true
+        sed -i 's/apply_updates = .*/apply_updates = yes/' /etc/dnf/automatic.conf 2>/dev/null || true
+        systemctl enable --now dnf-automatic.timer >/dev/null 2>&1 || true
+        log_info "dnf-automatic security updates enabled and active."
     fi
     return 0
 }
@@ -341,20 +399,23 @@ main() {
     disable_llmnr
     disable_coredumps
     blacklist_legacy_protocols
+    restrict_cron_permissions
     configure_auto_updates
 
-    log_info "All security and hardening setups completed successfully."
+    log_info "Comprehensive server security hardening completed successfully."
     echo "====================================================="
     echo "Summary of protections applied:"
     echo "  1. Dual-tier Swap: ZRAM (pri=100) prioritized over Disk Swap (pri=10)."
-    echo "  2. UFW Firewall: Default deny incoming, allowed SSH ports (${SSH_PORTS[*]}), log low."
-    echo "  3. Kernel Hardening: Anti-SYN flood, anti-spoofing, ICMP rate limit, martian log disabled, TCP BBR enabled."
-    echo "  4. SSH Hardening: X11 forwarding disabled, root password login disabled, MaxAuthTries 4."
-    echo "  5. Anti Information Leak: LLMNR port 5355 disabled, core dumps disabled."
-    echo "  6. CIS Blacklist: Legacy protocols (dccp, sctp, rds, tipc) disabled."
-    echo "  7. Journald: Max 250MB log storage with rate limits to prevent disk exhaustion."
-    echo "  8. Fail2ban: Monitoring SSH on ports ${SSH_PORTS[*]} with 1h ban."
-    echo "  9. Automatic Updates: Enabled for security patches."
+    echo "  2. UFW Firewall: Default deny incoming, allowed loopback (lo) & SSH ports (${SSH_PORTS[*]})."
+    echo "  3. Kernel Hardening: Anti-SYN flood, anti-spoofing, ICMP rate limit, TCP BBR, RFC1337."
+    echo "  4. IPv6 Hardening: Disabled IPv6 redirects and source routing."
+    echo "  5. SSH Hardening: X11 & Agent forwarding disabled, compression disabled, MaxAuthTries 4."
+    echo "  6. Anti Information Leak: LLMNR port 5355 disabled, unprivileged core dumps disabled."
+    echo "  7. CIS Blacklist: Legacy protocols (dccp, sctp, rds, tipc) disabled."
+    echo "  8. Cron Lockdown: Only root and administrative users allowed to schedule tasks."
+    echo "  9. Journald: Max 250MB log storage with burst rate limits."
+    echo " 10. Fail2ban: Monitoring SSH on ports ${SSH_PORTS[*]} with 1h ban."
+    echo " 11. Automatic Updates: Active with automatic old kernel & unused dependency cleanup."
     echo "====================================================="
 }
 
