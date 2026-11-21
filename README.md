@@ -18,11 +18,19 @@ Script hardening keamanan dan optimalisasi server Linux komprehensif:
 * **Unattended Upgrades**: Memasang patch keamanan distro secara otomatis di latar belakang.
 
 #### Penggunaan
-```bash
-# Langsung via cURL (dari GitHub)
-curl -sL https://raw.githubusercontent.com/opelooo/server_scripts/main/setup-server-security.sh | sudo bash
 
-# Atau eksekusi lokal
+**Opsi 1: Dari Gitea Pribadi**
+```bash
+curl -sL https://git.opelooo.uk/opelooo/server_scripts/raw/branch/main/setup-server-security.sh | sudo bash
+```
+
+**Opsi 2: Dari GitHub**
+```bash
+curl -sL https://raw.githubusercontent.com/opelooo/server_scripts/main/setup-server-security.sh | sudo bash
+```
+
+**Opsi 3: Eksekusi Lokal**
+```bash
 sudo ./setup-server-security.sh
 ```
 
@@ -36,10 +44,22 @@ Script add-on opsional untuk server yang ingin difungsikan sebagai **Tailscale P
 * Mengaktifkan client relay port via `tailscale set --relay-server-port`.
 
 #### Penggunaan
-```bash
-# Menggunakan port default 41641
-sudo ./setup-tailscale-relay.sh
 
-# Atau menggunakan port UDP custom
-sudo ./setup-tailscale-relay.sh 34780
+**Dari Gitea Pribadi:**
+```bash
+# Port default 41641
+curl -sL https://git.opelooo.uk/opelooo/server_scripts/raw/branch/main/setup-tailscale-relay.sh | sudo bash
+
+# Port custom (misal 34780)
+curl -sL https://git.opelooo.uk/opelooo/server_scripts/raw/branch/main/setup-tailscale-relay.sh | sudo bash -s 34780
+```
+
+**Dari GitHub:**
+```bash
+curl -sL https://raw.githubusercontent.com/opelooo/server_scripts/main/setup-tailscale-relay.sh | sudo bash
+```
+
+**Eksekusi Lokal:**
+```bash
+sudo ./setup-tailscale-relay.sh
 ```
