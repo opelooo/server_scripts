@@ -75,10 +75,10 @@ install_packages() {
     if [[ "${PKG_MGR}" == "apt" ]]; then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
-        apt-get install -y -qq ufw fail2ban unattended-upgrades curl iproute2 zram-tools cron
+        apt-get install -y -qq --no-install-recommends ufw fail2ban unattended-upgrades curl iproute2 zram-tools cron
     elif [[ "${PKG_MGR}" == "dnf" ]]; then
         dnf install -y -q epel-release || true
-        dnf install -y -q ufw fail2ban curl iproute zram-generator dnf-automatic cronie
+        dnf install -y -q --setopt=install_weak_deps=False ufw fail2ban curl iproute zram-generator dnf-automatic cronie
     fi
     return 0
 }
