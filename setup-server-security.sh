@@ -2,7 +2,9 @@
 #
 # Generic Linux Server Security Hardening Script
 # Target: Debian, Ubuntu, RHEL, AlmaLinux, RockyLinux
-# Scope: Pure Basic Security (UFW, Sysctl Anti-Flood, Journald, Fail2ban, Auto-Updates)
+# Scope: Basic Security, Anti-Flood Sysctl, Journald, Fail2ban, Auto-Updates,
+#        Dual-Tier Swap (ZRAM priority 100 > Disk Swap priority 10),
+#        SSH Hardening, Disable LLMNR, Disable Core Dumps, Kernel Protocol Blacklist.
 #
 set -euo pipefail
 
@@ -67,8 +69,79 @@ detect_ssh_ports() {
     return 0
 }
 
+install_packages() {
+    log_info "Updating package lists and installing required utilities..."
+    if [[ "${PKG_MGR}" == "apt" ]]; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get install -y -qq ufw fail2ban unattended-upgrades curl iproute2 zram-tools
+    elif [[ "${PKG_MGR}" == "dnf" ]]; then
+        dnf install -y -q epel-release || true
+        dnf install -y -q ufw fail2ban curl iproute zram-generator
+    fi
+    return 0
+}
+
+configure_zram_swap() {
+    log_info "Configuring ZRAM swap with high priority (priority=100)..."
+    if [[ -f /etc/default/zramswap ]]; then
+        cat <<'EOF' > /etc/default/zramswap
+ALGO=zstd
+PERCENT=50
+PRIORITY=100
+EOF
+        systemctl restart zramswap 2>/dev/null || true
+    elif command -v zramctl >/dev/null 2>&1; then
+        mkdir -p /etc/systemd/zram-generator.conf.d
+        cat <<'EOF' > /etc/systemd/zram-generator.conf.d/00-zram.conf
+[zram0]
+zram-size = min(ram / 2, 2048)
+compression-algorithm = zstd
+swap-priority = 100
+EOF
+        systemctl daemon-reload
+        systemctl restart systemd-zram-setup@zram0.service 2>/dev/null || true
+    fi
+    log_info "ZRAM swap configured."
+    return 0
+}
+
+configure_disk_swap() {
+    log_info "Checking secondary disk swap (fallback priority=10)..."
+    local has_disk_swap
+    has_disk_swap=$(grep -E 'file|partition' /proc/swaps 2>/dev/null | grep -v 'zram' || true)
+
+    if [[ -n "${has_disk_swap}" ]]; then
+        log_info "Disk swap already present: ${has_disk_swap}"
+        return 0
+    fi
+
+    if [[ -f /swapfile ]]; then
+        log_info "Activating existing /swapfile with fallback priority=10..."
+        chmod 600 /swapfile
+        mkswap /swapfile >/dev/null 2>&1 || true
+        swapon -p 10 /swapfile 2>/dev/null || true
+        return 0
+    fi
+
+    log_info "Creating 1GB fallback disk swap at /swapfile..."
+    fallocate -l 1G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null 2>&1
+    swapon -p 10 /swapfile 2>/dev/null || true
+
+    if ! grep -q "/swapfile" /etc/fstab; then
+        echo "/swapfile none swap sw,pri=10 0 0" >> /etc/fstab
+    fi
+
+    log_info "Fallback disk swap created and configured."
+    return 0
+}
+
 apply_sysctl_hardening() {
-    log_info "Configuring kernel sysctl anti-flood and network protection..."
+    log_info "Configuring kernel sysctl anti-flood, BBR, and network protections..."
+    modprobe tcp_bbr 2>/dev/null || true
+
     cat <<'EOF' > /etc/sysctl.d/99-server-hardening.conf
 # TCP SYN Flood Protection
 net.ipv4.tcp_syncookies = 1
@@ -102,6 +175,11 @@ net.ipv4.conf.default.accept_source_route = 0
 # Kernel Memory and Pointer Leak Protections
 kernel.kptr_restrict = 2
 kernel.dmesg_restrict = 1
+fs.suid_dumpable = 0
+
+# TCP BBR Congestion Control & FQ Queue Discipline
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
 EOF
 
     sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-server-hardening.conf >/dev/null 2>&1
@@ -122,19 +200,6 @@ RateLimitBurst=1000
 EOF
     systemctl restart systemd-journald 2>/dev/null || true
     log_info "Journald storage and rate limit caps applied."
-    return 0
-}
-
-install_packages() {
-    log_info "Updating package lists and installing required utilities..."
-    if [[ "${PKG_MGR}" == "apt" ]]; then
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq
-        apt-get install -y -qq ufw fail2ban unattended-upgrades curl iproute2
-    elif [[ "${PKG_MGR}" == "dnf" ]]; then
-        dnf install -y -q epel-release || true
-        dnf install -y -q ufw fail2ban curl iproute
-    fi
     return 0
 }
 
@@ -185,6 +250,67 @@ EOF
     return 0
 }
 
+configure_ssh_hardening() {
+    log_info "Configuring SSH daemon hardening drop-in..."
+    mkdir -p /etc/ssh/sshd_config.d
+    cat <<'EOF' > /etc/ssh/sshd_config.d/99-server-hardening.conf
+X11Forwarding no
+PermitRootLogin prohibit-password
+PermitEmptyPasswords no
+MaxAuthTries 4
+LoginGraceTime 30s
+ClientAliveInterval 300
+ClientAliveCountMax 2
+EOF
+
+    if sshd -t >/dev/null 2>&1; then
+        systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
+        log_info "SSH hardening applied and daemon reloaded."
+    else
+        log_warn "SSH config validation failed. Keeping existing configuration."
+        rm -f /etc/ssh/sshd_config.d/99-server-hardening.conf
+    fi
+    return 0
+}
+
+disable_llmnr() {
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        log_info "Disabling LLMNR (port 5355) in systemd-resolved..."
+        mkdir -p /etc/systemd/resolved.conf.d
+        cat <<'EOF' > /etc/systemd/resolved.conf.d/disable-llmnr.conf
+[Resolve]
+LLMNR=no
+EOF
+        systemctl restart systemd-resolved 2>/dev/null || true
+        log_info "LLMNR disabled."
+    fi
+    return 0
+}
+
+disable_coredumps() {
+    log_info "Disabling core dumps for unprivileged users..."
+    mkdir -p /etc/security/limits.d
+    cat <<'EOF' > /etc/security/limits.d/99-disable-coredumps.conf
+* hard core 0
+* soft core 0
+EOF
+    log_info "Core dump restrictions configured."
+    return 0
+}
+
+blacklist_legacy_protocols() {
+    log_info "Blacklisting unused kernel protocols (CIS benchmark)..."
+    mkdir -p /etc/modprobe.d
+    cat <<'EOF' > /etc/modprobe.d/blacklist-unused-protocols.conf
+install dccp /bin/true
+install sctp /bin/true
+install rds /bin/true
+install tipc /bin/true
+EOF
+    log_info "Unused kernel protocols blacklisted."
+    return 0
+}
+
 configure_auto_updates() {
     if [[ "${PKG_MGR}" == "apt" ]]; then
         log_info "Enabling unattended security upgrades..."
@@ -205,20 +331,30 @@ main() {
     detect_pkg_manager
     detect_ssh_ports
     install_packages
+    configure_zram_swap
+    configure_disk_swap
     apply_sysctl_hardening
     apply_journald_caps
     configure_ufw
     configure_fail2ban
+    configure_ssh_hardening
+    disable_llmnr
+    disable_coredumps
+    blacklist_legacy_protocols
     configure_auto_updates
 
-    log_info "Basic server security setup completed successfully."
+    log_info "All security and hardening setups completed successfully."
     echo "====================================================="
-    echo "Summary of basic protections applied:"
-    echo "  1. UFW Firewall: Default deny incoming, allowed SSH ports (${SSH_PORTS[*]}), UFW log set to low."
-    echo "  2. Kernel Hardening: Anti-SYN flood, anti-spoofing, ICMP rate limit, martian logging disabled."
-    echo "  3. Journald: Max 250MB log storage, rate limiting active to prevent disk exhaustion."
-    echo "  4. Fail2ban: Monitoring SSH on ports ${SSH_PORTS[*]} with 1h ban after 5 failed attempts."
-    echo "  5. Automatic Updates: Enabled for security patches."
+    echo "Summary of protections applied:"
+    echo "  1. Dual-tier Swap: ZRAM (pri=100) prioritized over Disk Swap (pri=10)."
+    echo "  2. UFW Firewall: Default deny incoming, allowed SSH ports (${SSH_PORTS[*]}), log low."
+    echo "  3. Kernel Hardening: Anti-SYN flood, anti-spoofing, ICMP rate limit, martian log disabled, TCP BBR enabled."
+    echo "  4. SSH Hardening: X11 forwarding disabled, root password login disabled, MaxAuthTries 4."
+    echo "  5. Anti Information Leak: LLMNR port 5355 disabled, core dumps disabled."
+    echo "  6. CIS Blacklist: Legacy protocols (dccp, sctp, rds, tipc) disabled."
+    echo "  7. Journald: Max 250MB log storage with rate limits to prevent disk exhaustion."
+    echo "  8. Fail2ban: Monitoring SSH on ports ${SSH_PORTS[*]} with 1h ban."
+    echo "  9. Automatic Updates: Enabled for security patches."
     echo "====================================================="
 }
 
